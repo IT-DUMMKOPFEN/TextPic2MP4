@@ -214,7 +214,7 @@ class MainActivity : Activity() {
         ).apply { visibility = View.GONE }
         col.addView(resultRow)
         col.addView(TextView(this).apply {
-            text = "Text2Video 0.1a · IT-Dummkopfen · Videos landen in Filme/Text2Video"
+            text = "Text2Video 0.1b · IT-Dummkopfen · Videos landen in Filme/Text2Video"
             alpha = 0.5f; textSize = 12f; setPadding(0, dp(16), 0, 0)
         })
 

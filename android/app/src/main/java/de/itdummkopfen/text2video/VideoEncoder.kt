@@ -15,8 +15,6 @@ import java.nio.ByteBuffer
 object VideoEncoder {
 
     private const val TIMEOUT_US = 10_000L
-    private const val COLOR_NV12 = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
-    private const val COLOR_I420 = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
     private const val COLOR_FLEX = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
 
     private class Sample(val data: ByteArray, val ptsUs: Long, val flags: Int)
@@ -38,40 +36,21 @@ object VideoEncoder {
         val w = FrameRenderer.W
         val h = FrameRenderer.H
 
+        // Flexibles YUV-Format: der Encoder gibt über getInputImage() sein echtes
+        // Speicherlayout (Zeilenabstand, Pixelabstand, Lage von U/V) vor.
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        val colors = codec.codecInfo
-            .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).colorFormats.toSet()
-        val color = when {
-            COLOR_NV12 in colors -> COLOR_NV12
-            COLOR_I420 in colors -> COLOR_I420
-            else -> COLOR_FLEX
-        }
         val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, color)
-            setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, COLOR_FLEX)
+            setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
             setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         }
         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         codec.start()
-
-        // Rohdaten einmal im passenden Speicherlayout vorbereiten
-        val raw: ByteArray? = when (color) {
-            COLOR_NV12 -> ByteArray(w * h * 3 / 2).also { a ->
-                System.arraycopy(frame.y, 0, a, 0, w * h)
-                var p = w * h
-                for (i in frame.u.indices) { a[p++] = frame.u[i]; a[p++] = frame.v[i] }
-            }
-            COLOR_I420 -> ByteArray(w * h * 3 / 2).also { a ->
-                System.arraycopy(frame.y, 0, a, 0, w * h)
-                System.arraycopy(frame.u, 0, a, w * h, frame.u.size)
-                System.arraycopy(frame.v, 0, a, w * h + frame.u.size, frame.v.size)
-            }
-            else -> null
-        }
+        val writer = FrameWriter(frame, w, h)
 
         out.delete()
         val muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -105,19 +84,10 @@ object VideoEncoder {
                             codec.queueInputBuffer(idx, 0, 0, pts, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             inputDone = true
                         } else {
-                            if (raw != null) {
-                                val buf = codec.getInputBuffer(idx)
-                                    ?: throw IOException("Encoder: kein Eingabepuffer")
-                                buf.clear()
-                                if (buf.capacity() < raw.size) throw IOException("Encoder-Puffer zu klein")
-                                buf.put(raw)
-                                codec.queueInputBuffer(idx, 0, raw.size, pts, 0)
-                            } else {
-                                val img = codec.getInputImage(idx)
-                                    ?: throw IOException("Encoder: kein Eingabebild")
-                                writeImage(img, frame, w, h)
-                                codec.queueInputBuffer(idx, 0, w * h * 3 / 2, pts, 0)
-                            }
+                            val img = codec.getInputImage(idx)
+                                ?: throw IOException("Encoder: kein Eingabebild")
+                            writer.write(img)
+                            codec.queueInputBuffer(idx, 0, w * h * 3 / 2, pts, 0)
                             frameNo++
                         }
                     }
@@ -221,28 +191,102 @@ object VideoEncoder {
         return Pair(outFormat ?: throw IOException("Audio-Encoder lieferte kein Format"), samples)
     }
 
-    /** Fallback für Encoder, die nur das flexible YUV-Format anbieten. */
-    private fun writeImage(img: Image, f: FrameRenderer.Yuv, w: Int, h: Int) {
-        val p = img.planes
-        writePlane(p[0], f.y, w, h)
-        writePlane(p[1], f.u, w / 2, h / 2)
-        writePlane(p[2], f.v, w / 2, h / 2)
-    }
+    /**
+     * Schreibt das Standbild in das Eingabebild des Encoders – passend zu dessen
+     * Layout. Wiederkehrende Layouts werden einmal vorbereitet und dann pro
+     * Frame nur noch blockweise kopiert.
+     */
+    private class FrameWriter(private val f: FrameRenderer.Yuv, private val w: Int, private val h: Int) {
+        private val cw = w / 2
+        private val ch = h / 2
+        private var yRows: ByteArray? = null     // Y mit Zeilenabstand des Encoders
+        private var uvRows: ByteArray? = null    // U/V verschränkt (NV12 oder NV21)
+        private var layoutKey = ""
 
-    private fun writePlane(plane: Image.Plane, src: ByteArray, w: Int, h: Int) {
-        val buf = plane.buffer
-        val rs = plane.rowStride
-        val ps = plane.pixelStride
-        if (ps == 1) {
-            for (row in 0 until h) {
-                buf.position(row * rs)
-                buf.put(src, row * w, w)
+        fun write(img: Image) {
+            val p = img.planes
+            val y = p[0]; val u = p[1]; val v = p[2]
+            val key = "${y.rowStride}/${y.pixelStride}/${u.rowStride}/${u.pixelStride}/${v.rowStride}/${v.pixelStride}"
+            if (key != layoutKey) { yRows = null; uvRows = null; layoutKey = key }
+
+            writeLuma(y)
+
+            if (u.pixelStride == 2 && v.pixelStride == 2 && u.rowStride == v.rowStride) {
+                when (chromaOrder(u.buffer, v.buffer)) {
+                    1 -> { writeInterleaved(u.buffer, v.buffer, u.rowStride, f.u, f.v); return }   // NV12: U zuerst
+                    2 -> { writeInterleaved(v.buffer, u.buffer, v.rowStride, f.v, f.u); return }   // NV21: V zuerst
+                }
             }
-        } else {
-            for (row in 0 until h) {
+            writePlaneGeneric(u, f.u, cw, ch)
+            writePlaneGeneric(v, f.v, cw, ch)
+        }
+
+        private fun writeLuma(plane: Image.Plane) {
+            val buf = plane.buffer
+            val rs = plane.rowStride
+            if (plane.pixelStride != 1) { writePlaneGeneric(plane, f.y, w, h); return }
+            if (rs == w) {
+                buf.position(0)
+                buf.put(f.y, 0, minOf(f.y.size, buf.remaining()))
+                return
+            }
+            val rows = yRows ?: ByteArray(rs * h).also { a ->
+                for (r in 0 until h) System.arraycopy(f.y, r * w, a, r * rs, w)
+                yRows = a
+            }
+            buf.position(0)
+            buf.put(rows, 0, minOf(rows.size, buf.remaining()))
+        }
+
+        /** 1 = V liegt direkt hinter U (NV12), 2 = U liegt direkt hinter V (NV21), 0 = getrennt. */
+        private fun chromaOrder(ub: ByteBuffer, vb: ByteBuffer): Int {
+            if (ub.limit() < 2 || vb.limit() < 2) return 0
+            val u1 = ub.get(1); val v0 = vb.get(0)
+            vb.put(0, 0x5A.toByte())
+            val nv12 = ub.get(1) == 0x5A.toByte()
+            vb.put(0, 0x00.toByte())
+            val nv12b = ub.get(1) == 0x00.toByte()
+            ub.put(1, u1); vb.put(0, v0)
+            if (nv12 && nv12b) return 1
+            val v1 = vb.get(1); val u0 = ub.get(0)
+            ub.put(0, 0x5A.toByte())
+            val nv21 = vb.get(1) == 0x5A.toByte()
+            ub.put(0, 0x00.toByte())
+            val nv21b = vb.get(1) == 0x00.toByte()
+            vb.put(1, v1); ub.put(0, u0)
+            return if (nv21 && nv21b) 2 else 0
+        }
+
+        private fun writeInterleaved(buf: ByteBuffer, other: ByteBuffer, rs: Int, first: ByteArray, second: ByteArray) {
+            val rows = uvRows ?: ByteArray(rs * ch).also { a ->
+                for (r in 0 until ch) {
+                    var o = r * rs
+                    val s = r * cw
+                    for (c in 0 until cw) { a[o++] = first[s + c]; a[o++] = second[s + c] }
+                }
+                uvRows = a
+            }
+            buf.position(0)
+            buf.put(rows, 0, minOf(rows.size, buf.remaining()))
+            // Der erste Puffer endet vor dem allerletzten Byte der zweiten Ebene –
+            // dieses über deren eigenen Puffer setzen.
+            val last = (ch - 1) * rs + (cw - 1) * 2
+            if (last < other.limit()) other.put(last, second[second.size - 1])
+        }
+
+        private fun writePlaneGeneric(plane: Image.Plane, src: ByteArray, pw: Int, ph: Int) {
+            val buf = plane.buffer
+            val rs = plane.rowStride
+            val ps = plane.pixelStride
+            for (row in 0 until ph) {
                 val base = row * rs
-                val s = row * w
-                for (col in 0 until w) buf.put(base + col * ps, src[s + col])
+                val s = row * pw
+                if (ps == 1) {
+                    buf.position(base)
+                    buf.put(src, s, pw)
+                } else {
+                    for (col in 0 until pw) buf.put(base + col * ps, src[s + col])
+                }
             }
         }
     }
