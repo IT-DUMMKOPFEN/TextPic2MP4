@@ -1,0 +1,47 @@
+name: Android APK bauen
+
+on:
+  push:
+    branches: [ main, master ]
+    paths: [ 'android/**', '.github/workflows/**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: APK bauen
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: APK umbenennen
+        run: cp app/build/outputs/apk/debug/app-debug.apk Text2Video.apk
+
+      - name: Als Build-Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Text2Video-APK
+          path: android/Text2Video.apk
+
+      - name: Als Release veröffentlichen (direkter Download aufs Handy)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Text2Video Build ${{ github.run_number }}
+          files: android/Text2Video.apk
